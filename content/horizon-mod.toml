@@ -1,0 +1,14 @@
+# Port-owned content mod for Laser Bridges & Doors 6.3 (MIT, Mars). The
+# assets, blockstates, models, textures, sounds and loot tables are the
+# upstream jar's own; the block declarations are hand-written for 26.3 (the
+# mod's `face`/`facing`/`powered`/`color` state set and its thin outlines are
+# not inferable from a vanilla template alone). Local-only until publishing is
+# approved (see ../LICENSE and ../notes.md).
+id = "laserbridges"
+name = "Laser Bridges & Doors"
+version = "6.3"
+description = "Redstone-powered laser sources that build bridges, doors and fences out of light"
+authors = ["Mars"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]

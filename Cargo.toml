@@ -1,0 +1,17 @@
+[package]
+# Ported from: Laser Bridges & Doors 6.3 (Mars-The-Planet/Laser-Bridges-And-Doors, MIT),
+# Minecraft Java 1.21.1 NeoForge. Local-only until the maintainer approves.
+name = "horizon-laserbridges"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Laser Bridges & Doors for Horizon: redstone-driven laser sources and beams"
+
+[lib]
+# This exact source is also injected as a same-crate module by horizon-mixins.
+path = "mixins/laserbridges/runtime.rs"
+
+[workspace]
+members = ["tools/audit"]
+resolver = "2"

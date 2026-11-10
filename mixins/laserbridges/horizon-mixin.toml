@@ -1,0 +1,97 @@
+[mod]
+id = "laserbridges"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "1d63e0a5a37a7a708eb0b32b49bf0dfeb28ed8a9"
+
+# The pure beam model: the line a source writes, its length, and the state a
+# placement gives it (standalone crate lib, injected as
+# `crate::game::laserbridges`).
+# The content half is inside this bundle (`data/laserbridges-content.hmod`, the built
+# `content/laserbridges.hmod`): this writes it to `.horizon-cache/` and appends it to the
+# dev-mod list, so one `.hnmod` installs the content and the code. The registry
+# keeps one file per project, so a split port could not be listed; AE2 ships the
+# same pattern.
+[[injection]]
+id = "embedded-content"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::mods::content_root"
+helper = "embedded_content.rs"
+bindings = [
+  { name = "root", ty = "&std::path::Path", value = "root" },
+  { name = "enabled", ty = "&std::collections::BTreeSet<String>", value = "enabled" },
+  { name = "dev", ty = "&[std::path::PathBuf]", value = "dev" },
+]
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "laserbridges"
+source = "runtime.rs"
+
+# Game-side glue: the source queue, the redstone read and the beam writes.
+[[module]]
+id = "state"
+file = "crates/horizon-client/src/game.rs"
+name = "laserbridges_state"
+source = "support.rs"
+
+# A placed source mounts on the clicked face and emits away from it.
+[[injection]]
+id = "state-for-placement"
+hook = "state_for_placement"
+hook_version = 1
+kind = "HEAD"
+helper = "placement.rs"
+bindings = [
+  { name = "level", ty = "&crate::game::GameLevel<'_>", value = "self" },
+  { name = "state", ty = "BlockStateId", value = "state" },
+  { name = "context", ty = "&PlacementContext", value = "context" },
+  { name = "answer", ty = "&mut Option<Option<BlockStateId>>", value = "answer" },
+]
+
+# A neighbour changed: a source's redstone input may have moved.
+[[injection]]
+id = "neighbor-changed"
+hook = "neighbor_changed"
+hook_version = 1
+kind = "HEAD"
+helper = "neighbor.rs"
+bindings = [
+  { name = "level", ty = "&crate::game::GameLevel<'_>", value = "self" },
+  { name = "dimension", ty = "LevelDimension", value = "dimension" },
+  { name = "pos", ty = "BlockPos", value = "pos" },
+  { name = "state", ty = "BlockStateId", value = "state" },
+]
+
+# A placed, replaced or removed source: evaluate it, or clear the beam the
+# removed one left (`old` still carries its face, facing and colour).
+[[injection]]
+id = "block-changed"
+hook = "block_changed"
+hook_version = 1
+kind = "HEAD"
+helper = "changed.rs"
+bindings = [
+  { name = "level", ty = "&crate::game::GameLevel<'_>", value = "self" },
+  { name = "dimension", ty = "LevelDimension", value = "dimension" },
+  { name = "pos", ty = "BlockPos", value = "pos" },
+  { name = "old", ty = "BlockStateId", value = "old" },
+  { name = "new", ty = "BlockStateId", value = "new" },
+]
+
+# End of the level tick: read each queued source's signal, set `powered` and
+# write (or clear) its beam.
+[[injection]]
+id = "level-tick-post"
+hook = "level_tick_post"
+hook_version = 1
+kind = "HEAD"
+helper = "tick_post.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+]
