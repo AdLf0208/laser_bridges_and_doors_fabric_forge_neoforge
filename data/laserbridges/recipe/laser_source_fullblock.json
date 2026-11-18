@@ -1,0 +1,15 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    " B ",
+    "III",
+    "III"
+  ],
+  "key": {
+    "B": "laserbridges:laser_source_block",
+    "I": "minecraft:iron_ingot"
+  },
+  "result": {
+    "id": "laserbridges:laser_source_fullblock"
+  }
+}
