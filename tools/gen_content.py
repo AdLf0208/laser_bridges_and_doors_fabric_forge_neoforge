@@ -11,9 +11,10 @@ light and occlusion have to be written out.
 They are derived from the upstream shapes, which are `Block.box` calls in
 1/16-block units (Laser Bridges & Doors 6.3, MIT):
 `Constants`, `BridgeSourceBlock`, `FenceSourceBlock`,
-`BridgeAttachedSourceBlock`, `FenceAttachedSourceBlock`, `LaserBridgeBlock`
-and `LaserFenceBlock`. This script is the audit trail for that translation;
-running it again rewrites the same files.
+`BridgeAttachedSourceBlock`, `FenceAttachedSourceBlock`, `LaserBridgeBlock`,
+`LaserFenceBlock`, `BridgeAttachedReceiverBlock` and
+`FenceAttachedReceiverBlock`. This script is the audit trail for that
+translation; running it again rewrites the same files.
 
     python3 tools/gen_content.py
 """
@@ -164,12 +165,77 @@ def fence_laser(face, facing):
     return (fence_beam(face, facing),)
 
 
+def receiver_bridge(face, facing):
+    """`BridgeAttachedReceiverBlock` (`ILaserGeneratingBlock.handleGetShape`)."""
+    if face == "floor":
+        if axis(facing) == "x":
+            return ((5, 0, 0, 11, 2, 16),)
+        return ((0, 0, 5, 16, 2, 11),)
+    if face == "ceiling":
+        if axis(facing) == "x":
+            return ((5, 14, 0, 11, 16, 16),)
+        return ((0, 14, 5, 16, 16, 11),)
+    return {
+        "east": ((0, 5, 0, 2, 11, 16),),
+        "west": ((14, 5, 0, 16, 11, 16),),
+        "north": ((0, 5, 14, 16, 11, 16),),
+        "south": ((0, 5, 0, 16, 11, 2),),
+    }[facing]
+
+
+def receiver_bridge_powered(face, facing):
+    """A powered bridge receiver adds the bridge beam's plane, as the sources do."""
+    return receiver_bridge(face, facing) + (bridge_beam(face, facing),)
+
+
+def receiver_fence(face, facing):
+    """`FenceAttachedReceiverBlock`."""
+    if face == "floor":
+        if axis(facing) == "x":
+            return ((0, 0, 5, 16, 2, 11),)
+        return ((5, 0, 0, 11, 2, 16),)
+    if face == "ceiling":
+        if axis(facing) == "x":
+            return ((0, 14, 5, 16, 16, 11),)
+        return ((5, 14, 0, 11, 16, 16),)
+    return {
+        "north": ((5, 0, 14, 11, 16, 16),),
+        "south": ((5, 0, 0, 11, 16, 2),),
+        "west": ((14, 0, 5, 16, 16, 11),),
+        "east": ((0, 0, 5, 2, 16, 11),),
+    }[facing]
+
+
+def receiver_fence_powered(face, facing):
+    """The fence receiver's powered shape mixes `Constants`' axes, as upstream does."""
+    if face == "floor":
+        extra = FZ if axis(facing) == "x" else FX
+    elif face == "ceiling":
+        extra = CZ if axis(facing) == "x" else CX
+    else:
+        extra = FENCE_NS if facing in ("north", "south") else FENCE_WE
+    return receiver_fence(face, facing) + (extra,)
+
+
 SOURCES = {
     "laser_source_block": (attached_bridge, attached_bridge_powered),
     "laser_source_fullblock": (full_bridge, full_bridge_powered),
     "laser_fence_source_block": (attached_fence, attached_fence_powered),
     "laser_fence_source_fullblock": (full_fence, full_fence_powered),
 }
+
+# `ModRegistry`: the two wall-mounted sources and the two receivers emit light only
+# while powered; everything else is a constant 10. The content schema takes that as
+# `state_light`, so the former constant-light deviation is gone.
+POWERED_LIGHT = {"properties": ["powered"], "values": {"true": 10, "false": 0}}
+
+RECEIVERS = {
+    "laser_attached_receiver": (receiver_bridge, receiver_bridge_powered),
+    "laser_attached_receiver_fence": (receiver_fence, receiver_fence_powered),
+}
+
+# `AbstractAttachedSourceBlock`'s two ids: the only sources whose light is per-state.
+ATTACHED = {"laser_source_block", "laser_fence_source_block"}
 
 LASERS = {
     "laser_block_powered": bridge_laser,
@@ -187,7 +253,35 @@ STATE_PROPERTIES = {
 }
 
 
-def source_file(name, shapes, powered_shapes):
+def source_file(name, shapes, powered_shapes, attached):
+    values = {}
+    for face in FACES:
+        for facing in FACINGS:
+            values[f"{face},{facing},false"] = boxes(*shapes(face, facing))
+            values[f"{face},{facing},true"] = boxes(*powered_shapes(face, facing))
+    block = {
+        "template": "minecraft:stone",
+        "properties": {
+            "hardness": 0.8,
+            "explosion_resistance": 0.8,
+            "light": 10,
+            "requires_tool": False,
+            "occludes": False,
+        },
+        "state_properties": STATE_PROPERTIES,
+        "shapes": {
+            "properties": ["face", "facing", "powered"],
+            "values": values,
+        },
+        "item": True,
+    }
+    if attached:
+        # `ModRegistry`: the attached sources' `lightLevel` is `POWERED ? 10 : 0`.
+        block["state_light"] = POWERED_LIGHT
+    return block
+
+
+def receiver_file(name, shapes, powered_shapes):
     values = {}
     for face in FACES:
         for facing in FACINGS:
@@ -198,10 +292,10 @@ def source_file(name, shapes, powered_shapes):
         "properties": {
             "hardness": 0.8,
             "explosion_resistance": 0.8,
-            "light": 10,
             "requires_tool": False,
             "occludes": False,
         },
+        "state_light": POWERED_LIGHT,
         "state_properties": STATE_PROPERTIES,
         "shapes": {
             "properties": ["face", "facing", "powered"],
@@ -291,6 +385,36 @@ RECIPES = {
         "ingredients": ["laserbridges:laser_fence_source_fullblock"],
         "result": {"id": "laserbridges:laser_source_fullblock"},
     },
+    "laser_attached_receiver": {
+        "type": "minecraft:crafting_shaped",
+        "pattern": ["IGI", "IEI", "III"],
+        "key": {
+            "I": "minecraft:iron_ingot",
+            "G": "minecraft:glass",
+            "E": "minecraft:redstone",
+        },
+        "result": {"id": "laserbridges:laser_attached_receiver"},
+    },
+    "laser_attached_receiver_fence": {
+        "type": "minecraft:crafting_shaped",
+        "pattern": ["III", "IEG", "III"],
+        "key": {
+            "I": "minecraft:iron_ingot",
+            "G": "minecraft:glass",
+            "E": "minecraft:redstone",
+        },
+        "result": {"id": "laserbridges:laser_attached_receiver_fence"},
+    },
+    "convert_receiver_to_fence": {
+        "type": "minecraft:crafting_shapeless",
+        "ingredients": ["laserbridges:laser_attached_receiver"],
+        "result": {"id": "laserbridges:laser_attached_receiver_fence"},
+    },
+    "convert_receiver_fence_to_receiver": {
+        "type": "minecraft:crafting_shapeless",
+        "ingredients": ["laserbridges:laser_attached_receiver_fence"],
+        "result": {"id": "laserbridges:laser_attached_receiver"},
+    },
 }
 
 TAB = {
@@ -301,6 +425,8 @@ TAB = {
         "laserbridges:laser_fence_source_block",
         "laserbridges:laser_source_fullblock",
         "laserbridges:laser_fence_source_fullblock",
+        "laserbridges:laser_attached_receiver",
+        "laserbridges:laser_attached_receiver_fence",
     ],
 }
 
@@ -312,13 +438,21 @@ def write(path, value):
 
 def main():
     for name, (shapes, powered) in SOURCES.items():
-        write(DATA / "horizon" / "block" / f"{name}.json", source_file(name, shapes, powered))
+        write(
+            DATA / "horizon" / "block" / f"{name}.json",
+            source_file(name, shapes, powered, name in ATTACHED),
+        )
+    for name, (shapes, powered) in RECEIVERS.items():
+        write(DATA / "horizon" / "block" / f"{name}.json", receiver_file(name, shapes, powered))
     for name, shapes in LASERS.items():
         write(DATA / "horizon" / "block" / f"{name}.json", laser_file(shapes))
     for name, recipe in RECIPES.items():
         write(DATA / "recipe" / f"{name}.json", recipe)
     write(DATA / "horizon" / "creative_tab" / "laserbridges.json", TAB)
-    print(f"wrote {len(SOURCES) + len(LASERS)} block declarations, {len(RECIPES)} recipes, 1 tab")
+    print(
+        f"wrote {len(SOURCES) + len(RECEIVERS) + len(LASERS)} block declarations, "
+        f"{len(RECIPES)} recipes, 1 tab"
+    )
 
 
 if __name__ == "__main__":

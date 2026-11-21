@@ -1,11 +1,12 @@
 id = "laserbridges"
 name = "Laser Bridges & Doors"
-version = "0.2.0"
+version = "0.2.1"
 description = """A port of Laser Bridges & Doors for Horizon: four redstone-powered laser sources (two
 wall-mounted bridges, two full-block doors) that write a line of laser blocks out of the air in front
-of them, the two laser blocks they write, the signal-strength-to-length mapping and the walkable
-plate. The two receivers, dyeing, the on/off sounds, the config file and the dispenser dye path are
-not implemented; the gap list is in the port's notes."""
+of them, the two laser blocks they write, the two laser receivers that power on a beam (or a powered
+source) and answer a redstone signal, the signal-strength-to-length mapping and the walkable plate.
+Dyeing, the on/off sounds, the config file and the dispenser dye path are not implemented; the gap
+list is in the port's notes."""
 authors = ["Mars (upstream)", "AdLf0208"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside
 # the content the same package carries in assets/ and data/. The id is the resource namespace and
@@ -20,5 +21,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

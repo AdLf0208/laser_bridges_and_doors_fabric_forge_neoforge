@@ -16,16 +16,19 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use mod_api::{
-    self, BlockChangedEvent, BlockFace, BlockMetadata, BlockPart, BlockState, BlockUpdateFlags,
-    Direction, Flow, Hooks, Host, HostBlockStates, HostSide, InteractionResult, LevelHost,
-    LevelRef, LevelTickPostEvent, LevelTicksHost, NeighborChangedEvent, Registrar,
-    RegistrationContext, ServerHost, StateConstraint, StateForPlacementEvent, SupportType,
-    UseItemOnBlockEvent, UsePhase,
+    self, BlockChangedEvent, BlockFace, BlockMetadata, BlockPart, BlockSignalEvent, BlockState,
+    BlockUpdateFlags, Direction, Flow, Hooks, Host, HostBlockStates, HostSide, InteractionResult,
+    IsSignalSourceEvent, LevelHost, LevelRef, LevelTickPostEvent, LevelTicksHost,
+    NeighborChangedEvent, Registrar, RegistrationContext, ServerHost, StateConstraint,
+    StateForPlacementEvent, SupportType, UseItemOnBlockEvent, UsePhase,
 };
 
 pub mod runtime;
 
-use runtime::{Beam, Cell, Clicked, Face, Facing, MAX_LENGTH, Write, placement, plan};
+use runtime::{
+    Beam, Cell, Clicked, Face, Facing, Front, MAX_LENGTH, Side, Write, look, placement, plan,
+    receiver_signal, receiver_update, state_property,
+};
 
 /// One source block: the laser block it writes, and whether it hangs on a support (upstream's
 /// `AbstractAttachedSourceBlock`; the full-block sources have no `canSurvive`).
@@ -73,15 +76,35 @@ const CUTTABLE: [&str; 5] = [
     "minecraft:dead_bush",
 ];
 
+/// The two blocks a beam writes: what a receiver reads as a live laser.
+const LASERS: [&str; 2] = [
+    "laserbridges:laser_block_powered",
+    "laserbridges:laser_fence_powered",
+];
+
+/// `ModRegistry`: the two laser receivers, which power on the beam in front of them and
+/// answer a redstone signal.
+const RECEIVERS: [&str; 2] = [
+    "laserbridges:laser_attached_receiver",
+    "laserbridges:laser_attached_receiver_fence",
+];
+
 /// The source with this block (or block item) id.
 fn source_of(id: &str) -> Option<Source> {
     SOURCES.iter().copied().find(|source| source.id == id)
 }
 
-/// Whether this block item is one of the two attached sources, the only ones upstream refuses to
-/// place without a sturdy face behind them.
-fn attached_item(id: &str) -> bool {
-    source_of(id).is_some_and(|source| source.attached)
+/// Whether this id is one of the two receivers.
+fn receiver_of(id: &str) -> Option<&'static str> {
+    RECEIVERS.iter().copied().find(|receiver| *receiver == id)
+}
+
+/// Whether this block item is one of the wall-mounted blocks upstream refuses to place
+/// without a sturdy face behind them: the two attached sources
+/// (`AbstractAttachedSourceBlock`) and the two receivers, which are
+/// `FaceAttachedHorizontalDirectionalBlock`s too.
+fn sturdy_item(id: &str) -> bool {
+    source_of(id).is_some_and(|source| source.attached) || receiver_of(id).is_some()
 }
 
 /// What one block change means for the beams: nothing, a new source to evaluate, an old source's
@@ -147,6 +170,18 @@ fn block_face(direction: Direction) -> BlockFace {
     }
 }
 
+/// The runtime [`Side`] of a [`Direction`].
+fn side(direction: Direction) -> Side {
+    match direction {
+        Direction::Down => Side::Down,
+        Direction::Up => Side::Up,
+        Direction::North => Side::North,
+        Direction::South => Side::South,
+        Direction::West => Side::West,
+        Direction::East => Side::East,
+    }
+}
+
 /// A parsed source state: which source, the beam its geometry describes, and whether it is powered.
 struct Parsed {
     source: Source,
@@ -178,10 +213,103 @@ fn parse(metadata: &dyn BlockMetadata, state: BlockState) -> Option<Parsed> {
     })
 }
 
-/// A source position's pending work for the next level tick.
+/// A parsed receiver state: where it looks and what it carries.
+struct Receiver {
+    face: Face,
+    facing: Facing,
+    powered: bool,
+    colour: u8,
+}
+
+/// The receiver a state spells, or `None` for anything else (including a source).
+fn parse_receiver(metadata: &dyn BlockMetadata, state: BlockState) -> Option<Receiver> {
+    receiver_of(metadata.name(state.block()).ok()?)?;
+    let face = Face::from_name(state.property(metadata, "face").ok()??)?;
+    let facing = Facing::from_name(state.property(metadata, "facing").ok()??)?;
+    let colour = state
+        .property(metadata, "color")
+        .ok()??
+        .parse::<u8>()
+        .ok()?;
+    let powered = state.property(metadata, "powered").ok().flatten() == Some("true");
+    Some(Receiver {
+        face,
+        facing,
+        powered,
+        colour,
+    })
+}
+
+/// What sits in the cell a receiver looks into.
+///
+/// Upstream's own direction test (`laserDir == dir.getOpposite()`) reads the *receiver's*
+/// state instead of the neighbour's, so it can never be true and every laser or powered
+/// source in front powers the receiver; that effective rule is what the port keeps.
+fn front(level: LevelRef, facts: &dyn Host, pos: [i32; 3], side: Side) -> Front {
+    let at = offset(pos, side.vector());
+    let Some(state) = level.block_state(facts, at) else {
+        return Front::Other;
+    };
+    let states = facts.block_states();
+    let Ok(name) = states.name(state.block()) else {
+        return Front::Other;
+    };
+    let colour = state
+        .property(&states, "color")
+        .ok()
+        .flatten()
+        .and_then(|colour| colour.parse::<u8>().ok())
+        .unwrap_or(0);
+    if LASERS.contains(&name) {
+        return Front::Laser { colour };
+    }
+    let powered = state.property(&states, "powered").ok().flatten() == Some("true");
+    if source_of(name).is_some() && powered {
+        return Front::PoweredSource { colour };
+    }
+    Front::Other
+}
+
+/// `IReceiverBlock.updateState`: read the cell the receiver looks into and write `powered`
+/// (and the laser's colour) when it differs from what the receiver carries.
+fn evaluate_receiver(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) {
+    let Some(current) = level.block_state(&*host, pos) else {
+        return;
+    };
+    let parsed = {
+        let facts: &dyn Host = &*host;
+        let states = facts.block_states();
+        parse_receiver(&states, current)
+    };
+    let Some(parsed) = parsed else {
+        return;
+    };
+    let seen = {
+        let facts: &dyn Host = &*host;
+        front(level, facts, pos, look(parsed.face, parsed.facing))
+    };
+    let Some((powered, colour)) = receiver_update(parsed.powered, parsed.colour, seen) else {
+        return;
+    };
+    let next = {
+        let facts: &dyn Host = &*host;
+        let states = facts.block_states();
+        let powered = current
+            .with(&states, "powered", if powered { "true" } else { "false" })
+            .ok();
+        powered.and_then(|state| state.with(&states, "color", &colour.to_string()).ok())
+    };
+    if let Some(next) = next {
+        // `Level.setBlock(.., UPDATE_ALL)`, then upstream's own neighbour calls: the write
+        // tells both neighbours anyway, and the signal is read from the new state.
+        let _ = level.set_block(host, pos, next, update_flags());
+    }
+}
+
+/// A position's pending work for the next level tick.
 #[derive(Clone, Copy, Default)]
 struct Job {
-    /// Read the redstone input and regenerate.
+    /// Read the redstone input (or the cell a receiver looks into) and settle the block.
     evaluate: bool,
     /// Clear the beam a removed (or replaced) source left: the old source state (its geometry) and
     /// the laser block it wrote.
@@ -348,34 +476,91 @@ fn xyz(pos: mod_api::BlockPos) -> [i32; 3] {
 /// A source block's own part: where a placement points it, and its redstone input moving.
 struct SourcePart;
 
+/// `getStateForPlacement` for every wall/floor/ceiling mount this mod registers: a vertical
+/// click mounts on the floor or ceiling and a horizontal one on the wall, emitting away from
+/// it. The attached blocks' support requirement is [`Hooks::use_item_on_block`]: this
+/// moment's level is read-only and has no sturdy-face query, while the use moment has the
+/// whole host.
+fn placement_state(
+    level: &dyn LevelHost,
+    event: &mut StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    let (face, facing) = placement(clicked(event.context.face), event.context.yaw);
+    let face = level.state_with_property(event.state, "face", face.name())?;
+    let state = level.state_with_property(face, "facing", facing.name())?;
+    Some(Some(state))
+}
+
+/// Queue this position for the next level tick: a neighbour changed, so a source's redstone
+/// input (or a receiver's front cell) may have moved. The level's own tick moments cannot
+/// replace blocks, which is why the work waits for [`Hooks::level_tick_post`].
+fn queue_evaluate(event: &NeighborChangedEvent) {
+    queue(
+        event.dimension.key().id(),
+        xyz(event.pos),
+        Job {
+            evaluate: true,
+            clear: None,
+        },
+    );
+}
+
 #[mod_api::horizon_part]
 impl BlockPart for SourcePart {
-    /// `AbstractSourceBlock.getStateForPlacement`: a vertical click mounts the source on the floor
-    /// or ceiling and a horizontal one on the wall, emitting away from it. The attached sources'
-    /// support requirement is [`Hooks::use_item_on_block`]: this moment's level is read-only and has
-    /// no sturdy-face query, while the use moment has the whole host.
     fn state_for_placement(
         &self,
         level: &dyn LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
-        let (face, facing) = placement(clicked(event.context.face), event.context.yaw);
-        let face = level.state_with_property(event.state, "face", face.name())?;
-        let state = level.state_with_property(face, "facing", facing.name())?;
-        Some(Some(state))
+        placement_state(level, event)
     }
 
-    /// A neighbour changed under this source: its redstone input may have moved, so queue it for
-    /// the next level tick (this level's ticks schedule, but cannot replace blocks).
     fn neighbor_changed(&self, _level: &mut dyn LevelTicksHost, event: &mut NeighborChangedEvent) {
-        queue(
-            event.dimension.key().id(),
-            xyz(event.pos),
-            Job {
-                evaluate: true,
-                clear: None,
-            },
-        );
+        queue_evaluate(event);
+    }
+}
+
+/// A laser receiver's own part: where a placement points it, the front cell that moves it,
+/// and the redstone signal it gives.
+struct ReceiverPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for ReceiverPart {
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        placement_state(level, event)
+    }
+
+    /// `AbstractAttachedReceiverBlock.neighborChanged`: the beam, source or block in front may
+    /// have changed, so queue the receiver for the next level tick.
+    fn neighbor_changed(&self, _level: &mut dyn LevelTicksHost, event: &mut NeighborChangedEvent) {
+        queue_evaluate(event);
+    }
+
+    /// `IReceiverBlock.handleIsSignalSource`: a receiver is a signal source whether or not it
+    /// is powered, so wire beside it connects.
+    fn is_signal_source(&self, _level: &dyn LevelHost, event: &mut IsSignalSourceEvent) {
+        event.source = true;
+    }
+
+    /// `IReceiverBlock.handleGetSignal` / `getDirectSignal`, asked from inside the level's own
+    /// update. The moment has no metadata service, so the state's serialized form is the only
+    /// route to `powered`/`face`/`facing`; nothing here reads or changes the world.
+    fn block_signal(&self, level: &dyn LevelHost, event: &mut BlockSignalEvent) {
+        let Some(text) = level.state_string(event.state) else {
+            return;
+        };
+        let (Some(face), Some(facing)) = (
+            state_property(&text, "face").and_then(Face::from_name),
+            state_property(&text, "facing").and_then(Facing::from_name),
+        ) else {
+            return;
+        };
+        let powered = state_property(&text, "powered") == Some("true");
+        event.signal = receiver_signal(powered, face, facing, side(event.face), event.direct);
     }
 }
 
@@ -384,25 +569,42 @@ struct Mod;
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
-    /// Attach the source part to the four sources. The part is per block, so the game asks it only
-    /// for these blocks and no method has to check which block it was asked about.
+    /// Attach each part to its blocks. A part is per block, so the game asks it only for these
+    /// blocks and no method has to check which block it was asked about.
     fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
         for source in SOURCES {
             let key = registrar.block_key(source.id);
             registrar.block_part(key, SourcePart);
         }
+        for receiver in RECEIVERS {
+            let key = registrar.block_key(receiver);
+            registrar.block_part(key, ReceiverPart);
+        }
     }
 
-    /// An authoritative server committed a changed state: evaluate a new source, and clear the beam
-    /// a removed or replaced one left. Applied at the next level tick, where the level writes.
+    /// An authoritative server committed a changed state: evaluate a new source or receiver, and
+    /// clear the beam a removed or replaced source left. Applied at the next level tick, where the
+    /// level writes.
     fn block_changed(&self, level: &dyn LevelHost, event: &mut BlockChangedEvent) {
         if event.old == event.new {
             return;
         }
-        let old = level.state_block(event.old).and_then(source_of);
-        let new = level.state_block(event.new).and_then(source_of);
+        let old_id = level.state_block(event.old);
+        let new_id = level.state_block(event.new);
+        let old = old_id.and_then(source_of);
+        let new = new_id.and_then(source_of);
         let (evaluate, clear) = match change(old, new) {
-            Change::Nothing => return,
+            Change::Nothing => {
+                // A receiver placed, replaced or removed needs no beam cleared: its signal
+                // goes with the block, and the level tells its neighbours as vanilla does.
+                if new_id.is_some_and(|id| receiver_of(id).is_some())
+                    || old_id.is_some_and(|id| receiver_of(id).is_some())
+                {
+                    (true, None)
+                } else {
+                    return;
+                }
+            }
             Change::Evaluate => (true, None),
             Change::Clear(beam) => (false, Some(beam)),
             Change::Replace(beam) => (true, Some(beam)),
@@ -450,6 +652,8 @@ impl Hooks for Mod {
                 parse(&states, current)
             };
             let Some(parsed) = parsed else {
+                // Not a source: the only other block of ours queued here is a receiver.
+                evaluate_receiver(host, level, pos);
                 continue;
             };
             let signal = level.best_neighbor_signal(&*host, pos).unwrap_or(0);
@@ -484,7 +688,7 @@ impl Hooks for Mod {
         let Some(stack) = click.stack else {
             return Flow::Continue;
         };
-        if !attached_item(&stack.item().id(&*host)) {
+        if !sturdy_item(&stack.item().id(&*host)) {
             return Flow::Continue;
         }
         let Some(face) = direction(click.hit.face) else {
@@ -540,12 +744,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_wall_sources_need_a_support() {
-        assert!(attached_item(BRIDGE));
-        assert!(attached_item(FENCE));
-        assert!(!attached_item(BRIDGE_FULL));
-        assert!(!attached_item(FENCE_FULL));
-        assert!(!attached_item("laserbridges:laser_block_powered"));
+    fn only_the_wall_mounted_blocks_need_a_support() {
+        assert!(sturdy_item(BRIDGE));
+        assert!(sturdy_item(FENCE));
+        assert!(!sturdy_item(BRIDGE_FULL));
+        assert!(!sturdy_item(FENCE_FULL));
+        assert!(!sturdy_item("laserbridges:laser_block_powered"));
+        // `AbstractAttachedReceiverBlock` is a `FaceAttachedHorizontalDirectionalBlock` too.
+        assert!(sturdy_item("laserbridges:laser_attached_receiver"));
+        assert!(sturdy_item("laserbridges:laser_attached_receiver_fence"));
+    }
+
+    #[test]
+    fn the_two_receivers_are_known_and_nothing_else_is() {
+        assert_eq!(
+            receiver_of("laserbridges:laser_attached_receiver"),
+            Some("laserbridges:laser_attached_receiver")
+        );
+        assert_eq!(
+            receiver_of("laserbridges:laser_attached_receiver_fence"),
+            Some("laserbridges:laser_attached_receiver_fence")
+        );
+        assert_eq!(receiver_of(BRIDGE), None);
+        assert_eq!(receiver_of("laserbridges:laser_block_powered"), None);
+        assert_eq!(receiver_of("minecraft:stone"), None);
     }
 
     #[test]

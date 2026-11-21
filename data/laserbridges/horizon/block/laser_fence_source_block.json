@@ -395,5 +395,14 @@
       ]
     }
   },
-  "item": true
+  "item": true,
+  "state_light": {
+    "properties": [
+      "powered"
+    ],
+    "values": {
+      "true": 10,
+      "false": 0
+    }
+  }
 }

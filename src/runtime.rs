@@ -181,6 +181,132 @@ pub fn plan(
     writes
 }
 
+/// One side of a cell: the six directions a receiver is asked about, and the six its
+/// `face`/`facing` resolve to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Down,
+    Up,
+    North,
+    South,
+    East,
+    West,
+}
+
+impl Side {
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::Down => Side::Up,
+            Side::Up => Side::Down,
+            Side::North => Side::South,
+            Side::South => Side::North,
+            Side::East => Side::West,
+            Side::West => Side::East,
+        }
+    }
+
+    /// The unit vector, minecraft's axes: east `+x`, south `+z`, up `+y`.
+    pub fn vector(self) -> [i32; 3] {
+        match self {
+            Side::Down => [0, -1, 0],
+            Side::Up => [0, 1, 0],
+            Side::North => [0, 0, -1],
+            Side::South => [0, 0, 1],
+            Side::East => [1, 0, 0],
+            Side::West => [-1, 0, 0],
+        }
+    }
+}
+
+impl Facing {
+    /// The [`Side`] of the same name.
+    pub fn side(self) -> Side {
+        match self {
+            Facing::North => Side::North,
+            Facing::South => Side::South,
+            Facing::East => Side::East,
+            Facing::West => Side::West,
+        }
+    }
+}
+
+/// The cell a mount looks into: `IReceiverBlock.updateState`'s `dir` — up from a
+/// floor mount, down from a ceiling one, along `facing` for a wall one.
+pub fn look(face: Face, facing: Facing) -> Side {
+    match face {
+        Face::Floor => Side::Up,
+        Face::Ceiling => Side::Down,
+        Face::Wall => facing.side(),
+    }
+}
+
+/// What a receiver finds in the cell it looks into, as far as its rule cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Front {
+    /// A laser block (`AbstractLaserBlock`), whatever its colour.
+    Laser { colour: u8 },
+    /// A source with its `powered` state set.
+    PoweredSource { colour: u8 },
+    /// Anything else, including an unpowered source.
+    Other,
+}
+
+/// The `(powered, color)` a receiver should carry for what it sees: powered by a
+/// laser or a powered source, carrying that block's colour; otherwise unpowered and
+/// keeping the colour it already had (upstream only assigns `color` inside its match).
+pub fn receiver_state(powered: bool, colour: u8, front: Front) -> (bool, u8) {
+    let _ = powered;
+    match front {
+        Front::Laser { colour } | Front::PoweredSource { colour } => (true, colour),
+        // Upstream never clears `color` when the laser leaves: it writes
+        // `POWERED=false` with the colour the state already had.
+        Front::Other => (false, colour),
+    }
+}
+
+/// The state write a receiver needs, or `None` when it already carries that state:
+/// `IReceiverBlock.updateState` writes only when `POWERED` moves.
+pub fn receiver_update(powered: bool, colour: u8, front: Front) -> Option<(bool, u8)> {
+    let next = receiver_state(powered, colour, front);
+    (next != (powered, colour)).then_some(next)
+}
+
+/// `IReceiverBlock.handleGetSignal` and `getDirectSignal`: a powered receiver gives 15,
+/// except on the face it hangs from (a normal signal) and everywhere but the face it
+/// looks into (a direct one).
+pub fn receiver_signal(
+    powered: bool,
+    face: Face,
+    facing: Facing,
+    asked: Side,
+    direct: bool,
+) -> i32 {
+    if !powered {
+        return 0;
+    }
+    if direct && asked != look(face, facing) {
+        return 0;
+    }
+    if asked == facing.side().opposite() {
+        return 0;
+    }
+    i32::from(FULL_POWER)
+}
+
+/// One property of a serialized block state (`laserbridges:x[face=wall,powered=true]`).
+///
+/// A block part's signal moment is handed a `BlockState` and a level, but no metadata
+/// service, so the state's own `level.state_string(..)` is the only way to read
+/// `powered`/`face`/`facing` there. Pure, so the parse is tested without a game.
+pub fn state_property<'a>(state: &'a str, name: &str) -> Option<&'a str> {
+    let (_, properties) = state.split_once('[')?;
+    let properties = properties.strip_suffix(']')?;
+    properties.split(',').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
 /// The face a player clicked to place a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clicked {
@@ -406,5 +532,167 @@ mod tests {
         assert_eq!(placement(Clicked::South, 0.0), (Face::Wall, Facing::North));
         assert_eq!(placement(Clicked::East, 0.0), (Face::Wall, Facing::West));
         assert_eq!(placement(Clicked::West, 0.0), (Face::Wall, Facing::East));
+    }
+
+    #[test]
+    fn a_floor_receiver_looks_up_and_a_ceiling_one_down() {
+        assert_eq!(look(Face::Floor, Facing::North), Side::Up);
+        assert_eq!(look(Face::Ceiling, Facing::East), Side::Down);
+    }
+
+    #[test]
+    fn a_wall_receiver_looks_along_its_facing() {
+        assert_eq!(look(Face::Wall, Facing::North), Side::North);
+        assert_eq!(look(Face::Wall, Facing::South), Side::South);
+        assert_eq!(look(Face::Wall, Facing::East), Side::East);
+        assert_eq!(look(Face::Wall, Facing::West), Side::West);
+    }
+
+    #[test]
+    fn every_side_has_an_opposite_and_a_unit_vector() {
+        for side in [
+            Side::Down,
+            Side::Up,
+            Side::North,
+            Side::South,
+            Side::East,
+            Side::West,
+        ] {
+            assert_eq!(side.opposite().opposite(), side, "{side:?}");
+            let [x, y, z] = side.vector();
+            let [ox, oy, oz] = side.opposite().vector();
+            assert_eq!([x + ox, y + oy, z + oz], [0, 0, 0], "{side:?}");
+        }
+        assert_eq!(Side::Up.vector(), [0, 1, 0]);
+        assert_eq!(Side::South.vector(), [0, 0, 1]);
+    }
+
+    #[test]
+    fn a_receiver_powers_on_a_laser_and_copies_its_colour() {
+        assert_eq!(
+            receiver_state(false, 0, Front::Laser { colour: 7 }),
+            (true, 7)
+        );
+        assert_eq!(
+            receiver_update(false, 0, Front::Laser { colour: 7 }),
+            Some((true, 7))
+        );
+    }
+
+    #[test]
+    fn a_powered_source_in_front_powers_a_receiver_but_an_unpowered_one_does_not() {
+        assert_eq!(
+            receiver_state(false, 0, Front::PoweredSource { colour: 3 }),
+            (true, 3)
+        );
+        assert_eq!(receiver_state(false, 0, Front::Other), (false, 0));
+    }
+
+    #[test]
+    fn a_receiver_that_already_carries_the_state_is_not_written() {
+        assert_eq!(receiver_update(true, 7, Front::Laser { colour: 7 }), None);
+        assert_eq!(receiver_update(false, 0, Front::Other), None);
+    }
+
+    #[test]
+    fn a_colour_change_on_a_powered_receiver_is_copied() {
+        // Upstream's own write is gated on POWERED moving, so a colour change
+        // under a powered receiver used to be lost; the port recomputes the pair.
+        assert_eq!(
+            receiver_update(true, 3, Front::Laser { colour: 9 }),
+            Some((true, 9))
+        );
+    }
+
+    #[test]
+    fn an_unpowered_receiver_keeps_the_last_colour_it_copied() {
+        assert_eq!(receiver_state(false, 5, Front::Other), (false, 5));
+        assert_eq!(receiver_update(false, 5, Front::Other), None);
+    }
+
+    #[test]
+    fn a_receiver_powers_down_when_the_laser_goes_away() {
+        assert_eq!(receiver_update(true, 5, Front::Other), Some((false, 5)));
+        assert_eq!(
+            receiver_update(true, 5, Front::PoweredSource { colour: 2 }),
+            Some((true, 2))
+        );
+    }
+
+    #[test]
+    fn a_powered_receiver_gives_15_on_every_face_but_the_one_it_hangs_from() {
+        // A wall receiver facing west hangs on its east face; upstream's
+        // `getSignal` answers 0 there and 15 everywhere else.
+        let powered = receiver_signal(true, Face::Wall, Facing::West, Side::West, false);
+        assert_eq!(powered, 15);
+        assert_eq!(
+            receiver_signal(true, Face::Wall, Facing::West, Side::Up, false),
+            15
+        );
+        assert_eq!(
+            receiver_signal(true, Face::Wall, Facing::West, Side::East, false),
+            0,
+            "the face it hangs from gives nothing"
+        );
+    }
+
+    #[test]
+    fn a_receiver_gives_a_direct_signal_only_on_the_face_it_looks_into() {
+        assert_eq!(
+            receiver_signal(true, Face::Wall, Facing::West, Side::West, true),
+            15
+        );
+        assert_eq!(
+            receiver_signal(true, Face::Wall, Facing::West, Side::Up, true),
+            0
+        );
+        assert_eq!(
+            receiver_signal(true, Face::Floor, Facing::North, Side::Up, true),
+            15
+        );
+        assert_eq!(
+            receiver_signal(true, Face::Floor, Facing::North, Side::North, true),
+            0
+        );
+    }
+
+    #[test]
+    fn an_unpowered_receiver_gives_no_signal_on_any_face() {
+        for side in [
+            Side::Down,
+            Side::Up,
+            Side::North,
+            Side::South,
+            Side::East,
+            Side::West,
+        ] {
+            assert_eq!(
+                receiver_signal(false, Face::Wall, Facing::West, side, false),
+                0,
+                "{side:?}"
+            );
+            assert_eq!(
+                receiver_signal(false, Face::Wall, Facing::West, side, true),
+                0,
+                "{side:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_serialized_state_gives_its_properties() {
+        let state =
+            "laserbridges:laser_attached_receiver[color=0,face=wall,facing=west,powered=true]";
+        assert_eq!(state_property(state, "face"), Some("wall"));
+        assert_eq!(state_property(state, "facing"), Some("west"));
+        assert_eq!(state_property(state, "powered"), Some("true"));
+        assert_eq!(state_property(state, "color"), Some("0"));
+        assert_eq!(state_property(state, "missing"), None);
+        assert_eq!(state_property("minecraft:stone", "face"), None);
+        assert_eq!(
+            state_property("minecraft:x[facex=north,face=north]", "face"),
+            Some("north"),
+            "a longer key must not answer for the one asked"
+        );
     }
 }

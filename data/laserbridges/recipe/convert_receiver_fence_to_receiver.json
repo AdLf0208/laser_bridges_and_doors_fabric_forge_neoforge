@@ -1,0 +1,9 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "ingredients": [
+    "laserbridges:laser_attached_receiver_fence"
+  ],
+  "result": {
+    "id": "laserbridges:laser_attached_receiver"
+  }
+}
